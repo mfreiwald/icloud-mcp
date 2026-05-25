@@ -404,24 +404,128 @@ async def get_messages(
         except Exception as _e:
             pass
 
+def _build_imap_search_criteria(
+    query: str,
+    search_body: bool,
+    since: Optional[str],
+    before: Optional[str],
+) -> list:
+    """
+    Build an IMAP SEARCH criteria list.
+
+    Splits multi-word queries on whitespace and AND-combines per-word
+    matches across Subject, From, and (optionally) Body fields. Each
+    word becomes its own OR(subject, from[, body]) cluster, then all
+    clusters are implicitly AND-ed together by IMAP.
+
+    Date filters (since/before) are added at the top level as AND
+    conditions. Date format: YYYY-MM-DD; IMAP expects DD-Mon-YYYY so
+    we convert.
+    """
+    words = [w for w in query.split() if w]
+    if not words:
+        words = [""]  # match nothing meaningfully — but keep criteria valid
+
+    criteria: list = []
+
+    # Date filters first (AND-ed with the rest)
+    for label, value in (("SINCE", since), ("BEFORE", before)):
+        if not value:
+            continue
+        try:
+            dt = datetime.strptime(value, "%Y-%m-%d")
+            criteria.extend([label, dt.strftime("%d-%b-%Y")])
+        except ValueError:
+            # Silently skip invalid dates rather than erroring out
+            pass
+
+    # Per-word OR clusters
+    for word in words:
+        if search_body:
+            # OR(SUBJECT, OR(FROM, BODY))
+            cluster = ['OR', ['SUBJECT', word], ['OR', ['FROM', word], ['BODY', word]]]
+        else:
+            cluster = ['OR', ['SUBJECT', word], ['FROM', word]]
+        criteria.extend(cluster)
+
+    return criteria
+
+
 async def search_messages(
     context: Context,
     query: str,
     folder: str = "INBOX",
-    limit: int = 50
+    limit: int = 50,
+    search_body: bool = False,
+    since: Optional[str] = None,
+    before: Optional[str] = None,
+    folders: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """
-    Search for messages by text query.
+    Search messages with IMAP server-side search.
+
+    Multi-word queries are AND-combined per word. Substring matches
+    are server-side and literal (not fuzzy). Across one or more
+    folders.
 
     Args:
-        query: Search text (searches subject and from fields)
-        folder: Folder name (default: INBOX)
-        limit: Maximum number of results
+        query: Search text. Multi-word queries are split on whitespace
+            and each word must match independently in Subject/From
+            (and Body if search_body=True).
+        folder: Single folder name (default: INBOX). Ignored if
+            `folders` is provided.
+        limit: Maximum number of results per folder (default: 50).
+        search_body: If True, also search the message body. Slower.
+        since: Only include messages on/after this date (YYYY-MM-DD).
+        before: Only include messages before this date (YYYY-MM-DD).
+        folders: Optional list of folders to search across. If set,
+            results are merged across folders, capped at `limit` per
+            folder, sorted by date desc.
 
     Returns:
-        List of matching messages
+        List of matching messages.
     """
     username, password = require_auth(context)
+
+    target_folders = folders if folders else [folder]
+    all_results: List[Dict[str, Any]] = []
+
+    for fld in target_folders:
+        try:
+            results = await _search_messages_in_folder(
+                username, password, query, fld, limit,
+                search_body, since, before,
+            )
+            all_results.extend(results)
+        except Exception as e:
+            logger.error(f"Search failed for folder {fld}: {e}")
+            continue
+
+    # Sort by date desc when searching multiple folders. Best-effort
+    # parsing — fall back to insertion order on parse failure.
+    if folders and len(target_folders) > 1:
+        def _parse_date(d: str):
+            try:
+                from email.utils import parsedate_to_datetime
+                return parsedate_to_datetime(d)
+            except Exception:
+                return datetime.min
+        all_results.sort(key=lambda m: _parse_date(m.get("date", "")), reverse=True)
+
+    return all_results
+
+
+async def _search_messages_in_folder(
+    username: str,
+    password: str,
+    query: str,
+    folder: str,
+    limit: int,
+    search_body: bool,
+    since: Optional[str],
+    before: Optional[str],
+) -> List[Dict[str, Any]]:
+    """Per-folder search; extracted so multi-folder loop can call it."""
     client = _get_imap_client(username, password)
 
     try:
@@ -430,11 +534,8 @@ async def search_messages(
         # Try server-side search with UTF-8 charset (RFC 2978)
         # This works with modern IMAP servers including iCloud
         try:
-            # Search by subject or from using UTF-8 charset
-            messages = client.search(
-                ['OR', ['SUBJECT', query], ['FROM', query]],
-                charset='UTF-8'
-            )
+            criteria = _build_imap_search_criteria(query, search_body, since, before)
+            messages = client.search(criteria, charset='UTF-8')
 
             message_ids = list(messages)[-limit:] if len(messages) > limit else list(messages)
             message_ids.reverse()
@@ -556,13 +657,44 @@ async def search_messages(
                 except Exception as _e:
                     continue
 
-            # Filter messages locally (supports any Unicode)
-            query_lower = query.lower()
+            # Local fallback: multi-word AND, optional body, date filters
+            words = [w.lower() for w in query.split() if w]
+
+            def _matches(msg: Dict[str, Any]) -> bool:
+                haystack = " ".join([
+                    msg.get("subject", ""),
+                    msg.get("from", ""),
+                    msg.get("to", ""),
+                ])
+                if search_body:
+                    haystack += " " + msg.get("body_text", "")
+                haystack = haystack.lower()
+                return all(w in haystack for w in words) if words else True
+
+            def _within_date(msg: Dict[str, Any]) -> bool:
+                if not (since or before):
+                    return True
+                try:
+                    from email.utils import parsedate_to_datetime
+                    d = parsedate_to_datetime(msg.get("date", ""))
+                except Exception:
+                    return True
+                if since:
+                    try:
+                        if d < datetime.fromisoformat(since).replace(tzinfo=d.tzinfo):
+                            return False
+                    except Exception:
+                        pass
+                if before:
+                    try:
+                        if d >= datetime.fromisoformat(before).replace(tzinfo=d.tzinfo):
+                            return False
+                    except Exception:
+                        pass
+                return True
+
             filtered_messages = [
-                msg for msg in all_messages
-                if query_lower in msg.get("subject", "").lower()
-                or query_lower in msg.get("from", "").lower()
-                or query_lower in msg.get("to", "").lower()
+                msg for msg in all_messages if _matches(msg) and _within_date(msg)
             ]
 
             return filtered_messages[:limit]
