@@ -413,22 +413,17 @@ def _build_imap_search_criteria(
     """
     Build an IMAP SEARCH criteria list.
 
-    Splits multi-word queries on whitespace and AND-combines per-word
-    matches across Subject, From, and (optionally) Body fields. Each
-    word becomes its own OR(subject, from[, body]) cluster, then all
-    clusters are implicitly AND-ed together by IMAP.
+    Multi-word queries are split on whitespace. Each word becomes its
+    own OR(SUBJECT, FROM[, BODY]) cluster, kept as a nested list so
+    imapclient wraps it in parentheses. Top-level criteria are
+    implicitly AND-combined by IMAP.
 
-    Date filters (since/before) are added at the top level as AND
-    conditions. Date format: YYYY-MM-DD; IMAP expects DD-Mon-YYYY so
-    we convert.
+    Date filters (since/before) are added at the top level. Date
+    format: YYYY-MM-DD; IMAP expects DD-Mon-YYYY so we convert.
     """
     words = [w for w in query.split() if w]
-    if not words:
-        words = [""]  # match nothing meaningfully — but keep criteria valid
-
     criteria: list = []
 
-    # Date filters first (AND-ed with the rest)
     for label, value in (("SINCE", since), ("BEFORE", before)):
         if not value:
             continue
@@ -436,17 +431,28 @@ def _build_imap_search_criteria(
             dt = datetime.strptime(value, "%Y-%m-%d")
             criteria.extend([label, dt.strftime("%d-%b-%Y")])
         except ValueError:
-            # Silently skip invalid dates rather than erroring out
             pass
 
-    # Per-word OR clusters
-    for word in words:
+    # Single-word query: emit the cluster flat so IMAP sees the OR
+    # at top level — matches the original mike-tih behavior.
+    # Multi-word query: emit each cluster as a NESTED list so
+    # imapclient wraps it in parens, giving us a proper AND of ORs.
+    if len(words) == 1:
+        word = words[0]
         if search_body:
-            # OR(SUBJECT, OR(FROM, BODY))
-            cluster = ['OR', ['SUBJECT', word], ['OR', ['FROM', word], ['BODY', word]]]
+            criteria.extend(['OR', ['SUBJECT', word], ['OR', ['FROM', word], ['BODY', word]]])
         else:
-            cluster = ['OR', ['SUBJECT', word], ['FROM', word]]
-        criteria.extend(cluster)
+            criteria.extend(['OR', ['SUBJECT', word], ['FROM', word]])
+    else:
+        for word in words:
+            if search_body:
+                cluster = ['OR', ['SUBJECT', word], ['OR', ['FROM', word], ['BODY', word]]]
+            else:
+                cluster = ['OR', ['SUBJECT', word], ['FROM', word]]
+            criteria.append(cluster)
+
+    if not criteria:
+        criteria = ['ALL']
 
     return criteria
 
