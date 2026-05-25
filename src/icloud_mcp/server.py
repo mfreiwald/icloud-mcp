@@ -395,18 +395,45 @@ async def email_search(
     context,
     query: str,
     folder: str = "INBOX",
-    limit: int = 50
+    limit: int = 50,
+    search_body: bool = False,
+    since: str | None = None,
+    before: str | None = None,
+    folders: list[str] | None = None,
 ) -> list | dict:
     """
-    Search for messages by text query.
+    Search emails via IMAP. Server-side, literal substring match.
+
+    Matching rules:
+      * Multi-word queries are split on whitespace and ALL words must
+        match (AND). Each word is matched as a literal substring.
+      * By default only the Subject and From headers are searched.
+        Pass search_body=True to also search the body (slower).
+      * For fuzzy/conceptual searches (e.g. "emails about my Crete
+        trip"), prefer email_list_messages with a higher limit and
+        filter the returned body_text in your reasoning instead — the
+        IMAP server cannot do fuzzy matching.
 
     Args:
-        query: Search text (searches subject and from fields)
-        folder: Folder name (default: INBOX)
-        limit: Maximum number of results (default: 50)
+        query: Whitespace-separated literal terms. All terms must
+            match (AND). Example: "DHL Tracking" matches subjects
+            containing both "DHL" and "Tracking".
+        folder: Folder to search (default: INBOX). Ignored if `folders`
+            is given. Common folders: INBOX, "Sent Messages", Archive,
+            Junk, "Deleted Messages", Drafts.
+        limit: Max results per folder (default: 50).
+        search_body: Also search message body. Default False (faster,
+            headers only).
+        since: Only include messages on/after this date (YYYY-MM-DD).
+        before: Only include messages before this date (YYYY-MM-DD).
+        folders: Optional list of folders to search. Results are merged
+            across folders and sorted newest-first.
     """
     try:
-        return await email_module.search_messages(context, query, folder, limit)
+        return await email_module.search_messages(
+            context, query, folder, limit,
+            search_body=search_body, since=since, before=before, folders=folders,
+        )
     except AuthenticationError as e:
         return {"error": str(e), "status": 401}
     except Exception as e:
