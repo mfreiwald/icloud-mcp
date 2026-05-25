@@ -537,6 +537,15 @@ async def _search_messages_in_folder(
     try:
         client.select_folder(folder)
 
+        # Multi-word AND of ORs across SUBJECT/FROM/BODY is not portably
+        # supported by all IMAP servers — iCloud in particular does not
+        # match the obvious nested-OR encoding. Skip server-side search
+        # for multi-word queries and use the local-filter path directly,
+        # which is deterministic and supports body matching.
+        words = [w for w in query.split() if w]
+        if len(words) > 1:
+            raise RuntimeError("multi-word query — using local filter path")
+
         # Try server-side search with UTF-8 charset (RFC 2978)
         # This works with modern IMAP servers including iCloud
         try:
@@ -600,15 +609,28 @@ async def _search_messages_in_folder(
             return result
 
         except Exception as charset_error:
-            # Fallback: If CHARSET UTF-8 is not supported by server,
-            # fall back to local filtering (less efficient but always works)
-            logger.error(f"Server-side UTF-8 search failed: {charset_error}. Falling back to local filtering.")
+            # Fallback path: used both when UTF-8 SEARCH is unsupported
+            # AND for multi-word queries (where server-side AND of ORs
+            # is unreliable across IMAP servers, notably iCloud).
+            logger.error(f"Falling back to local filtering: {charset_error}")
 
-            # Fetch more messages to search through locally
-            fetch_limit = max(limit * 10, 200)
+            # Pre-narrow with date filters where possible — much faster
+            # on large mailboxes than fetching ALL.
+            narrow: list = []
+            for label, value in (("SINCE", since), ("BEFORE", before)):
+                if not value:
+                    continue
+                try:
+                    dt = datetime.strptime(value, "%Y-%m-%d")
+                    narrow.extend([label, dt.strftime("%d-%b-%Y")])
+                except ValueError:
+                    pass
+            if not narrow:
+                narrow = ['ALL']
 
-            # Get all message IDs
-            all_msg_ids = client.search(['ALL'])
+            fetch_limit = max(limit * 10, 300)
+
+            all_msg_ids = client.search(narrow)
             message_ids = list(all_msg_ids)[-fetch_limit:] if len(all_msg_ids) > fetch_limit else list(all_msg_ids)
             message_ids.reverse()
 
