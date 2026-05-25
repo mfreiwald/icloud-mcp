@@ -537,18 +537,17 @@ async def _search_messages_in_folder(
     try:
         client.select_folder(folder)
 
-        # Multi-word AND of ORs across SUBJECT/FROM/BODY is not portably
-        # supported by all IMAP servers — iCloud in particular does not
-        # match the obvious nested-OR encoding. Skip server-side search
-        # for multi-word queries and use the local-filter path directly,
-        # which is deterministic and supports body matching.
-        words = [w for w in query.split() if w]
-        if len(words) > 1:
-            raise RuntimeError("multi-word query — using local filter path")
-
         # Try server-side search with UTF-8 charset (RFC 2978)
-        # This works with modern IMAP servers including iCloud
+        # This works with modern IMAP servers including iCloud — but
+        # only for single-word queries. Multi-word AND of ORs across
+        # SUBJECT/FROM/BODY is not portably supported by all IMAP
+        # servers — iCloud in particular does not match the obvious
+        # nested-OR encoding. For multi-word queries we raise from
+        # inside the try so the local-filter except path takes over.
         try:
+            words = [w for w in query.split() if w]
+            if len(words) > 1:
+                raise RuntimeError("multi-word query — using local filter path")
             criteria = _build_imap_search_criteria(query, search_body, since, before)
             messages = client.search(criteria, charset='UTF-8')
 
