@@ -1,5 +1,7 @@
 # iCloud MCP Server
 
+> Fork of [mike-tih/icloud-mcp](https://github.com/mike-tih/icloud-mcp): adds multi-word and multi-folder `email_search` and publishes `ghcr.io/mfreiwald/icloud-mcp` (tag `sha-<commit>`) from `main`.
+
 [Model Context Protocol](https://modelcontextprotocol.io) server for iCloud. Gives Claude (Desktop, Code, claude.ai connectors) and any other MCP client full access to an iCloud account:
 
 - **Calendar** (CalDAV): list/search/create/update/delete events, recurring events (RRULE), alerts (VALARM), IANA timezones, all-day events, iTIP invitations and cancellations by email.
