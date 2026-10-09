@@ -318,7 +318,7 @@ def email_list_messages(
 
 @tool("email", annotations=READ_ONLY)
 def email_search(
-    query: Annotated[str | None, Field(description="Text matched against Subject OR From.")] = None,
+    query: Annotated[str | None, Field(description="Words matched against Subject OR From; every word must match (in any order).")] = None,
     sender: Annotated[str | None, Field(description="Text/address matched against From (full addresses work best).")] = None,
     recipient: Annotated[str | None, Field(description="Text/address matched against To or Cc.")] = None,
     subject: Annotated[str | None, Field(description="Text matched against Subject.")] = None,
@@ -329,14 +329,19 @@ def email_search(
     folder: Folder = "INBOX",
     limit: Limit = 50,
     include_body: IncludeBody = True,
+    folders: Annotated[
+        list[str] | None,
+        Field(description="Search several folders at once (e.g. [\"INBOX\", \"Archive\", \"Sent Messages\"]); overrides folder."),
+    ] = None,
 ) -> list[dict[str, Any]]:
     """Server-side IMAP search. All provided filters are combined with AND; at least one is required.
 
-    Returns the same fields as email_list_messages, newest first.
+    Returns the same fields as email_list_messages, newest first; with folders, merged across them
+    (each result carries its folder, needed for follow-up calls).
     """
     return _run(
         mail_module.search_messages,
-        query, sender, recipient, subject, body, since, before, unread_only, folder, limit, include_body,
+        query, sender, recipient, subject, body, since, before, unread_only, folder, limit, include_body, folders,
     )
 
 

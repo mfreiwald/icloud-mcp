@@ -3,7 +3,7 @@
 import email as email_lib
 import logging
 from datetime import date
-from email.utils import formatdate
+from email.utils import formatdate, parsedate_to_datetime
 from typing import Any
 
 from imapclient import IMAPClient
@@ -156,6 +156,7 @@ def search_messages(
     folder: str = "INBOX",
     limit: int = 50,
     include_body: bool = True,
+    folders: list[str] | None = None,
 ) -> list[dict[str, Any]]:
     if not any([query, sender, recipient, subject, body, since, before, unread_only]):
         raise ValueError(
@@ -163,8 +164,6 @@ def search_messages(
         )
 
     criteria: list[Any] = []
-    if query:
-        criteria.append(["OR", ["SUBJECT", query], ["FROM", query]])
     if sender:
         criteria.extend(["FROM", sender])
     if recipient:
@@ -181,30 +180,70 @@ def search_messages(
         criteria.extend(["BEFORE", before_date])
     if unread_only:
         criteria.append("UNSEEN")
+    words = query.split() if query else []
 
     username, password = require_auth()
     client = get_imap_client(username, password)
     try:
-        client.select_folder(folder, readonly=True)
-        try:
-            uids = list(client.search(criteria, charset="UTF-8"))
-        except Exception as e:
-            # Some servers reject CHARSET UTF-8; fall back to ASCII search when possible,
-            # otherwise to a local scan of recent headers.
-            logger.warning("UTF-8 IMAP search failed (%s); falling back", e)
-            try:
-                uids = list(client.search(criteria))
-            except Exception:
-                return _local_search(client, folder, query, sender, recipient, subject, limit, include_body)
-        return _fetch_summaries(client, _newest(uids, limit), folder, include_body)
+        if not folders:
+            return _search_folder(client, folder, criteria, words, sender, recipient, subject, limit, include_body)
+        results: list[dict[str, Any]] = []
+        for name in dict.fromkeys(folders):
+            results.extend(
+                _search_folder(client, name, criteria, words, sender, recipient, subject, limit, include_body)
+            )
+        results.sort(key=_message_time, reverse=True)
+        return results[:limit]
     finally:
         close_imap_client(client)
+
+
+def _search_folder(
+    client: IMAPClient,
+    folder: str,
+    criteria: list[Any],
+    words: list[str],
+    sender: str | None,
+    recipient: str | None,
+    subject: str | None,
+    limit: int,
+    include_body: bool,
+) -> list[dict[str, Any]]:
+    client.select_folder(folder, readonly=True)
+    try:
+        if words:
+            # One flat OR(SUBJECT, FROM) search per word, intersected: every word must match.
+            # iCloud does not evaluate a single search with several nested OR groups reliably.
+            uid_sets = [_imap_search(client, [*criteria, ["OR", ["SUBJECT", w], ["FROM", w]]]) for w in words]
+            uids = list(set.intersection(*uid_sets))
+        else:
+            uids = list(_imap_search(client, criteria))
+    except Exception as e:
+        logger.warning("IMAP search failed in %s (%s); scanning recent headers locally", folder, e)
+        return _local_search(client, folder, words, sender, recipient, subject, limit, include_body)
+    return _fetch_summaries(client, _newest(uids, limit), folder, include_body)
+
+
+def _imap_search(client: IMAPClient, criteria: list[Any]) -> set[int]:
+    try:
+        return set(client.search(criteria, charset="UTF-8"))
+    except Exception as e:
+        # Some servers reject CHARSET UTF-8; retry as plain ASCII search.
+        logger.warning("UTF-8 IMAP search failed (%s); retrying without charset", e)
+        return set(client.search(criteria))
+
+
+def _message_time(item: dict[str, Any]) -> float:
+    try:
+        return parsedate_to_datetime(item.get("date", "")).timestamp()
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _local_search(
     client: IMAPClient,
     folder: str,
-    query: str | None,
+    words: list[str],
     sender: str | None,
     recipient: str | None,
     subject: str | None,
@@ -213,10 +252,11 @@ def _local_search(
 ) -> list[dict[str, Any]]:
     uids = _newest(list(client.search(["ALL"])), max(limit * 10, 200))
     candidates = _fetch_summaries(client, uids, folder, include_body=False)
+    words = [w.lower() for w in words]
 
     def matches(item: dict[str, Any]) -> bool:
         subj, frm, to = item["subject"].lower(), item["from"].lower(), item["to"].lower()
-        if query and query.lower() not in subj and query.lower() not in frm:
+        if any(w not in subj and w not in frm for w in words):
             return False
         if sender and sender.lower() not in frm:
             return False
